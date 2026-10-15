@@ -33,7 +33,16 @@ npm start
 
 ```bash
 curl http://127.0.0.1:9863/health
+curl http://127.0.0.1:9863/api/query/progress
 ```
+
+### 歌词比歌曲快 / 慢
+
+桥接默认带 `350ms` 延迟（`FOLIA_NP_OFFSET_MS`），并实现 Folia 的 `/api/query/progress` 校正。
+
+- 歌词仍偏快：`FOLIA_NP_OFFSET_MS=600 npm start`（可再加大）
+- 歌词偏慢：`FOLIA_NP_OFFSET_MS=0 npm start` 或负值如 `-200`
+- 也可在 Folia **设置 → 播放控制 → 全局时间偏移** 微调
 
 首次运行时，系统可能提示允许终端 / Node 控制「音乐」应用，请允许。
 
