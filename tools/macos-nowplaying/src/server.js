@@ -13,14 +13,22 @@
 
 import http from 'node:http';
 import { WebSocketServer } from 'ws';
-import { readMusicSnapshot } from './musicSource.js';
+import {
+  getCachedMusicSnapshot,
+  readMusicSnapshot,
+  startMonitor,
+  stopMusicMonitor,
+} from './musicSource.js';
 import { fetchLyrics } from './lyrics.js';
 
 const PORT = Number(process.env.FOLIA_NP_PORT || 9863);
 const HOST = process.env.FOLIA_NP_HOST || '127.0.0.1';
-const POLL_MS = Number(process.env.FOLIA_NP_POLL_MS || 250);
-/** Positive = delay lyrics vs audio (lyrics currently too early → try 300~800). Unit: ms. */
-const OFFSET_MS = Number(process.env.FOLIA_NP_OFFSET_MS || 350);
+/** How often we inspect the cached Music snapshot and decide whether to push WS events. */
+const POLL_MS = Number(process.env.FOLIA_NP_POLL_MS || 200);
+/** Min interval between PlayerProgress WS pushes. Folia extrapolates between them — too frequent re-anchors stutter. */
+const PROGRESS_PUSH_MS = Number(process.env.FOLIA_NP_PROGRESS_PUSH_MS || 1500);
+/** Positive = delay lyrics vs audio (lyrics early → increase). Unit: ms. */
+const OFFSET_MS = Number(process.env.FOLIA_NP_OFFSET_MS || 500);
 const WS_PATH = '/api/ws/lyric';
 const DEMO = process.env.FOLIA_NP_DEMO === '1' || process.argv.includes('--demo');
 
@@ -56,10 +64,12 @@ let lastTrackId = null;
 let lastTitle = '';
 let lastArtist = '';
 let lastPaused = true;
-let lastProgressMs = -1;
+let lastEmittedProgressMs = -1;
+let lastProgressPushAt = 0;
 let lyricTrackKey = '';
 let lyricInFlight = null;
-let tickRunning = false;
+/** Smoothed music position in ms (before offset). */
+let smoothPosMs = null;
 /** @type {{ progressMs: number, paused: boolean, atMs: number } | null} */
 let lastProgressSample = null;
 
@@ -82,43 +92,45 @@ function trackKey(snap) {
   return `${snap.id || ''}|${snap.title || ''}|${snap.artist || ''}|${Math.round(snap.duration || 0)}`;
 }
 
-/**
- * Convert Music.app position into Folia progress ms.
- * - Compensates AppleScript read latency (sample ≈ midpoint of the call)
- * - Applies OFFSET_MS so lyrics can be delayed when they run ahead of audio
- */
-function toProgressMs(snap, { extrapolate = false } = {}) {
+function rawPositionMs(snap) {
   const positionSec = Number(snap.position) || 0;
   const readLatencyMs = Number(snap.readLatencyMs) || 0;
   const isPlaying = String(snap.state).toLowerCase() === 'playing';
   let ms = positionSec * 1000;
-
-  // AppleScript returns a position captured during the call; advance by half the call time.
-  if (isPlaying) {
-    ms += readLatencyMs / 2;
-  }
-
-  // If this sample is reused a moment later (HTTP probe cache), keep wall-clock going.
-  if (extrapolate && isPlaying && snap.sampledAtMs) {
+  if (isPlaying) ms += readLatencyMs / 2;
+  if (isPlaying && snap.sampledAtMs) {
     ms += Math.max(0, Date.now() - snap.sampledAtMs);
   }
-
-  ms -= OFFSET_MS;
-  return Math.max(0, Math.floor(ms));
+  return Math.max(0, ms);
 }
 
-async function readLiveSnapshot() {
-  if (DEMO) {
-    return readDemoSnapshot(demoStartedAt);
+/**
+ * Smooth + clamp spikes so Folia does not keep re-anchoring (>0.2s drift).
+ * Returns progress ms AFTER offset (what Folia should display).
+ */
+function toProgressMs(snap, { resetSmooth = false } = {}) {
+  const isPlaying = String(snap.state).toLowerCase() === 'playing';
+  let raw = rawPositionMs(snap);
+
+  if (resetSmooth || smoothPosMs === null || !isPlaying) {
+    smoothPosMs = raw;
+  } else {
+    const delta = raw - smoothPosMs;
+    // Reject absurd jumps (seek handled via track change / pause path).
+    if (delta < -1500 || delta > 2500) {
+      // keep previous smooth value; next HTTP probe / pause will resync
+    } else {
+      // Light EMA toward the new sample
+      smoothPosMs = smoothPosMs * 0.72 + raw * 0.28;
+    }
   }
-  const started = Date.now();
-  const snap = await readMusicSnapshot();
-  const readLatencyMs = Date.now() - started;
-  return {
-    ...snap,
-    sampledAtMs: started + Math.floor(readLatencyMs / 2),
-    readLatencyMs,
-  };
+
+  return Math.max(0, Math.floor(smoothPosMs - OFFSET_MS));
+}
+
+function currentSnap() {
+  if (DEMO) return readDemoSnapshot(demoStartedAt);
+  return getCachedMusicSnapshot();
 }
 
 function broadcastLyric(snap, lrc, source) {
@@ -184,85 +196,87 @@ function emitPauseState(snap, isPaused, progressMs) {
   });
 }
 
-function emitProgress(progressMs) {
-  if (Math.abs(progressMs - lastProgressMs) < 40) return;
-  lastProgressMs = progressMs;
+function emitProgress(progressMs, { force = false } = {}) {
+  const now = Date.now();
+  if (!force && now - lastProgressPushAt < PROGRESS_PUSH_MS) return;
+  if (!force && Math.abs(progressMs - lastEmittedProgressMs) < 80) return;
+  lastProgressPushAt = now;
+  lastEmittedProgressMs = progressMs;
   lastProgressSample = {
     progressMs,
     paused: lastPaused,
-    atMs: Date.now(),
+    atMs: now,
   };
   broadcast('PlayerProgress', { progress: progressMs });
 }
 
 const demoStartedAt = Date.now();
+if (!DEMO) startMonitor();
 
-async function tick() {
-  if (tickRunning) return;
-  tickRunning = true;
-  try {
-    const snap = await readLiveSnapshot();
+function tick() {
+  const snap = currentSnap();
 
-    if (!snap.ok || !snap.hasSong) {
-      if (lastTrackId !== null) {
-        lastTrackId = null;
-        lastTitle = '';
-        lastArtist = '';
-        lastPaused = true;
-        lastProgressMs = -1;
-        lastProgressSample = null;
-        lyricTrackKey = '';
-        broadcast('PlayerProgressReplay', {});
-        broadcast('PlayerPauseState', {
-          hasSong: false,
-          isPaused: true,
-          seekbarCurrentPosition: 0,
-          statePercent: 0,
-        });
-      }
-      return;
-    }
-
-    const id = String(snap.id || `${snap.title}|${snap.artist}`);
-    const changed = id !== lastTrackId
-      || snap.title !== lastTitle
-      || snap.artist !== lastArtist;
-
-    const progressMs = toProgressMs(snap);
-
-    if (changed) {
-      lastTrackId = id;
-      lastTitle = snap.title || '';
-      lastArtist = snap.artist || '';
-      lastProgressMs = -1;
+  if (!snap.ok || !snap.hasSong) {
+    if (lastTrackId !== null) {
+      lastTrackId = null;
+      lastTitle = '';
+      lastArtist = '';
+      lastPaused = true;
+      lastEmittedProgressMs = -1;
+      lastProgressSample = null;
+      smoothPosMs = null;
+      lyricTrackKey = '';
       broadcast('PlayerProgressReplay', {});
-      emitTrack(snap);
-      void ensureLyrics(snap);
+      broadcast('PlayerPauseState', {
+        hasSong: false,
+        isPaused: true,
+        seekbarCurrentPosition: 0,
+        statePercent: 0,
+      });
     }
+    return;
+  }
 
-    const isPaused = String(snap.state).toLowerCase() !== 'playing';
-    if (isPaused !== lastPaused || changed) {
-      lastPaused = isPaused;
-      emitPauseState(snap, isPaused, progressMs);
-    }
+  const id = String(snap.id || `${snap.title}|${snap.artist}`);
+  const changed = id !== lastTrackId
+    || snap.title !== lastTitle
+    || snap.artist !== lastArtist;
 
-    if (!isPaused) {
-      emitProgress(progressMs);
-    } else {
-      lastProgressSample = {
-        progressMs,
-        paused: true,
-        atMs: Date.now(),
-      };
-    }
-  } finally {
-    tickRunning = false;
+  const progressMs = toProgressMs(snap, { resetSmooth: changed });
+
+  if (changed) {
+    lastTrackId = id;
+    lastTitle = snap.title || '';
+    lastArtist = snap.artist || '';
+    lastEmittedProgressMs = -1;
+    lastProgressPushAt = 0;
+    broadcast('PlayerProgressReplay', {});
+    emitTrack(snap);
+    void ensureLyrics(snap);
+  }
+
+  const isPaused = String(snap.state).toLowerCase() !== 'playing';
+  if (isPaused !== lastPaused || changed) {
+    lastPaused = isPaused;
+    emitPauseState(snap, isPaused, progressMs);
+    // Force one precise anchor on pause/resume/seek-ish transitions.
+    emitProgress(progressMs, { force: true });
+    return;
+  }
+
+  if (!isPaused) {
+    emitProgress(progressMs);
+  } else {
+    lastProgressSample = {
+      progressMs,
+      paused: true,
+      atMs: Date.now(),
+    };
   }
 }
 
-/** Snapshot used to catch up newly connected Folia clients. */
 async function pushSnapshotTo(client) {
-  const snap = await readLiveSnapshot();
+  const snap = DEMO ? readDemoSnapshot(demoStartedAt) : await readMusicSnapshot();
   if (!snap.ok || !snap.hasSong) {
     sendTo(client, 'PlayerPauseState', {
       hasSong: false,
@@ -273,7 +287,7 @@ async function pushSnapshotTo(client) {
     return;
   }
 
-  const progressMs = toProgressMs(snap);
+  const progressMs = toProgressMs(snap, { resetSmooth: true });
   const isPaused = String(snap.state).toLowerCase() !== 'playing';
 
   sendTo(client, 'Track', {
@@ -295,6 +309,8 @@ async function pushSnapshotTo(client) {
   });
   sendTo(client, 'PlayerProgress', { progress: progressMs });
   lastProgressSample = { progressMs, paused: isPaused, atMs: Date.now() };
+  lastEmittedProgressMs = progressMs;
+  lastProgressPushAt = Date.now();
 
   if (DEMO) {
     sendTo(client, 'Lyric', {
@@ -335,7 +351,12 @@ async function pushSnapshotTo(client) {
 
 async function handleProgressQuery(res) {
   try {
-    const snap = await readLiveSnapshot();
+    // Prefer recent monitor cache to avoid expensive one-shot osascript on Folia's 7s probe.
+    let snap = currentSnap();
+    const stale = !snap.sampledAtMs || Date.now() - snap.sampledAtMs > 1500;
+    if (!DEMO && (!snap.ok || stale)) {
+      snap = await readMusicSnapshot();
+    }
     if (!snap.ok || !snap.hasSong) {
       res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
       res.end(JSON.stringify({ progress: 0 }));
@@ -350,7 +371,6 @@ async function handleProgressQuery(res) {
     res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
     res.end(JSON.stringify({ progress }));
   } catch (error) {
-    // Fall back to last WS sample with light extrapolation so Folia can still correct.
     if (lastProgressSample) {
       let progress = lastProgressSample.progressMs;
       if (!lastProgressSample.paused) {
@@ -380,12 +400,12 @@ const server = http.createServer((req, res) => {
       clients: clients.size,
       offsetMs: OFFSET_MS,
       pollMs: POLL_MS,
+      progressPushMs: PROGRESS_PUSH_MS,
       mode: DEMO ? 'demo' : 'Music.app',
     }));
     return;
   }
 
-  // Folia stage controller polls this every ~7s for drift correction.
   if (url === '/api/query/progress' || url.startsWith('/api/query/progress?')) {
     void handleProgressQuery(res);
     return;
@@ -396,7 +416,8 @@ const server = http.createServer((req, res) => {
     `Folia macOS Now Playing bridge\n`
     + `WebSocket: ws://${HOST}:${PORT}${WS_PATH}\n`
     + `Progress:  GET /api/query/progress\n`
-    + `Offset:    ${OFFSET_MS}ms (FOLIA_NP_OFFSET_MS)\n`,
+    + `Offset:    ${OFFSET_MS}ms (FOLIA_NP_OFFSET_MS)\n`
+    + `Progress push every ${PROGRESS_PUSH_MS}ms (FOLIA_NP_PROGRESS_PUSH_MS)\n`,
   );
 });
 
@@ -417,18 +438,24 @@ server.listen(PORT, HOST, () => {
   console.log(`[np]   HTTP  http://${HOST}:${PORT}/health`);
   console.log(`[np]   PROG  http://${HOST}:${PORT}/api/query/progress`);
   console.log(`[np]   WS    ws://${HOST}:${PORT}${WS_PATH}`);
-  console.log(`[np]   mode  ${DEMO ? 'demo' : 'Music.app'}`);
-  console.log(`[np]   offset ${OFFSET_MS}ms (lyrics early → increase FOLIA_NP_OFFSET_MS)`);
+  console.log(`[np]   mode  ${DEMO ? 'demo' : 'Music.app (persistent monitor)'}`);
+  console.log(`[np]   offset ${OFFSET_MS}ms | progress push ${PROGRESS_PUSH_MS}ms`);
   console.log(`[np] Open Folia → 设置 → 连接与集成 → 舞台模式 → Now Playing`);
 });
 
 setInterval(() => {
-  void tick().catch((err) => {
+  try {
+    tick();
+  } catch (err) {
     console.warn('[np] poll error:', err instanceof Error ? err.message : err);
-  });
+  }
 }, POLL_MS);
 
-process.on('SIGINT', () => {
+function shutdown() {
+  stopMusicMonitor();
   server.close();
   process.exit(0);
-});
+}
+
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);

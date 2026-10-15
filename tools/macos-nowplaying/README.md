@@ -44,8 +44,11 @@ curl http://127.0.0.1:9863/health
 | --- | --- | --- |
 | `FOLIA_NP_HOST` | `127.0.0.1` | Bind host |
 | `FOLIA_NP_PORT` | `9863` | Port (Folia Now Playing is fixed to this) |
-| `FOLIA_NP_POLL_MS` | `250` | Music.app poll interval |
-| `FOLIA_NP_OFFSET_MS` | `350` | Delay lyrics vs audio (ms). If lyrics are early, increase (e.g. `600`). If late, decrease or use `0` / negative |
+| `FOLIA_NP_POLL_MS` | `200` | How often the Node side reads the cached Music snapshot |
+| `FOLIA_NP_PROGRESS_PUSH_MS` | `1500` | Min interval between `PlayerProgress` WS pushes (Folia extrapolates; too frequent causes stutter) |
+| `FOLIA_NP_OFFSET_MS` | `500` | Delay lyrics vs audio (ms). If lyrics are early, increase (e.g. `700`). If late, decrease or use `0` / negative |
+
+Music.app is observed by a **persistent** `osascript` monitor (not one process per poll), which reduces CPU spikes and lyric stutter.
 
 Also implements Folia's drift-correction probe:
 
