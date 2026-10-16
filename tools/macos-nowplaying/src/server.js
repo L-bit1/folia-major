@@ -1,14 +1,16 @@
 #!/usr/bin/env node
 /**
- * Folia macOS Now Playing bridge
+ * Folia macOS Now Playing bridge (memory-conscious)
  *
- * Speaks the same WebSocket protocol Folia expects from Widdit's Now Playing service:
+ * Speaks the same WebSocket protocol Folia expects:
  *   ws://localhost:9863/api/ws/lyric
- *
- * Also implements Folia's precise progress HTTP probe:
+ * And Folia's precise progress probe:
  *   GET http://localhost:9863/api/query/progress → { "progress": <ms> }
  *
- * Events: Track | Lyric | PlayerPauseState | PlayerProgress | PlayerProgressReplay
+ * Memory strategy:
+ * - Do not start the AppleScript monitor until a Folia client connects
+ * - Pause the monitor shortly after the last client disconnects
+ * - Small lyric LRU, no deflate WS contexts, capped Node heap via npm start
  */
 
 import http from 'node:http';
@@ -17,18 +19,19 @@ import {
   getCachedMusicSnapshot,
   readMusicSnapshot,
   startMonitor,
+  pauseMonitor,
   stopMusicMonitor,
+  isMonitorRunning,
 } from './musicSource.js';
-import { fetchLyrics } from './lyrics.js';
+import { fetchLyrics, lyricCacheSize } from './lyrics.js';
 
 const PORT = Number(process.env.FOLIA_NP_PORT || 9863);
 const HOST = process.env.FOLIA_NP_HOST || '127.0.0.1';
-/** How often we inspect the cached Music snapshot and decide whether to push WS events. */
-const POLL_MS = Number(process.env.FOLIA_NP_POLL_MS || 200);
-/** Min interval between PlayerProgress WS pushes. Folia extrapolates between them — too frequent re-anchors stutter. */
+const POLL_MS = Number(process.env.FOLIA_NP_POLL_MS || 250);
 const PROGRESS_PUSH_MS = Number(process.env.FOLIA_NP_PROGRESS_PUSH_MS || 1500);
-/** Positive = delay lyrics vs audio (lyrics early → increase). Unit: ms. */
 const OFFSET_MS = Number(process.env.FOLIA_NP_OFFSET_MS || 500);
+/** Keep monitor alive this long after last client leaves (avoids thrash on reconnect). */
+const IDLE_STOP_MS = Number(process.env.FOLIA_NP_IDLE_STOP_MS || 15000);
 const WS_PATH = '/api/ws/lyric';
 const DEMO = process.env.FOLIA_NP_DEMO === '1' || process.argv.includes('--demo');
 
@@ -68,17 +71,17 @@ let lastEmittedProgressMs = -1;
 let lastProgressPushAt = 0;
 let lyricTrackKey = '';
 let lyricInFlight = null;
-/** Smoothed music position in ms (before offset). */
 let smoothPosMs = null;
 /** @type {{ progressMs: number, paused: boolean, atMs: number } | null} */
 let lastProgressSample = null;
+/** @type {ReturnType<typeof setTimeout> | null} */
+let idleStopTimer = null;
 
 function broadcast(event, data) {
+  if (clients.size === 0) return;
   const payload = JSON.stringify({ event, data });
   for (const client of clients) {
-    if (client.readyState === 1) {
-      client.send(payload);
-    }
+    if (client.readyState === 1) client.send(payload);
   }
 }
 
@@ -104,23 +107,15 @@ function rawPositionMs(snap) {
   return Math.max(0, ms);
 }
 
-/**
- * Smooth + clamp spikes so Folia does not keep re-anchoring (>0.2s drift).
- * Returns progress ms AFTER offset (what Folia should display).
- */
 function toProgressMs(snap, { resetSmooth = false } = {}) {
   const isPlaying = String(snap.state).toLowerCase() === 'playing';
-  let raw = rawPositionMs(snap);
+  const raw = rawPositionMs(snap);
 
   if (resetSmooth || smoothPosMs === null || !isPlaying) {
     smoothPosMs = raw;
   } else {
     const delta = raw - smoothPosMs;
-    // Reject absurd jumps (seek handled via track change / pause path).
-    if (delta < -1500 || delta > 2500) {
-      // keep previous smooth value; next HTTP probe / pause will resync
-    } else {
-      // Light EMA toward the new sample
+    if (delta >= -1500 && delta <= 2500) {
       smoothPosMs = smoothPosMs * 0.72 + raw * 0.28;
     }
   }
@@ -131,6 +126,54 @@ function toProgressMs(snap, { resetSmooth = false } = {}) {
 function currentSnap() {
   if (DEMO) return readDemoSnapshot(demoStartedAt);
   return getCachedMusicSnapshot();
+}
+
+function ensureMonitorForClients() {
+  if (DEMO) return;
+  if (idleStopTimer) {
+    clearTimeout(idleStopTimer);
+    idleStopTimer = null;
+  }
+  if (clients.size > 0) {
+    startMonitor();
+  }
+}
+
+function scheduleIdleStop() {
+  if (DEMO) return;
+  if (idleStopTimer) clearTimeout(idleStopTimer);
+  idleStopTimer = setTimeout(() => {
+    idleStopTimer = null;
+    if (clients.size === 0) {
+      pauseMonitor();
+      // Drop track bookkeeping so reconnect starts clean without retaining lyric key state.
+      lastTrackId = null;
+      lastTitle = '';
+      lastArtist = '';
+      lastPaused = true;
+      lastEmittedProgressMs = -1;
+      lastProgressSample = null;
+      smoothPosMs = null;
+      lyricTrackKey = '';
+      if (typeof globalThis.gc === 'function') {
+        try { globalThis.gc(); } catch { /* optional */ }
+      }
+      console.log('[np] idle: Music monitor paused (no clients)');
+    }
+  }, IDLE_STOP_MS);
+}
+
+function memoryStats() {
+  const mem = process.memoryUsage();
+  return {
+    rssMb: Math.round(mem.rss / 1024 / 1024),
+    heapUsedMb: Math.round(mem.heapUsed / 1024 / 1024),
+    heapTotalMb: Math.round(mem.heapTotal / 1024 / 1024),
+    externalMb: Math.round(mem.external / 1024 / 1024),
+    lyricCache: lyricCacheSize(),
+    monitor: isMonitorRunning(),
+    clients: clients.size,
+  };
 }
 
 function broadcastLyric(snap, lrc, source) {
@@ -202,18 +245,16 @@ function emitProgress(progressMs, { force = false } = {}) {
   if (!force && Math.abs(progressMs - lastEmittedProgressMs) < 80) return;
   lastProgressPushAt = now;
   lastEmittedProgressMs = progressMs;
-  lastProgressSample = {
-    progressMs,
-    paused: lastPaused,
-    atMs: now,
-  };
+  lastProgressSample = { progressMs, paused: lastPaused, atMs: now };
   broadcast('PlayerProgress', { progress: progressMs });
 }
 
 const demoStartedAt = Date.now();
-if (!DEMO) startMonitor();
 
 function tick() {
+  // No Folia clients → do nothing (monitor should also be paused after idle grace).
+  if (clients.size === 0 && !DEMO) return;
+
   const snap = currentSnap();
 
   if (!snap.ok || !snap.hasSong) {
@@ -259,7 +300,6 @@ function tick() {
   if (isPaused !== lastPaused || changed) {
     lastPaused = isPaused;
     emitPauseState(snap, isPaused, progressMs);
-    // Force one precise anchor on pause/resume/seek-ish transitions.
     emitProgress(progressMs, { force: true });
     return;
   }
@@ -267,11 +307,7 @@ function tick() {
   if (!isPaused) {
     emitProgress(progressMs);
   } else {
-    lastProgressSample = {
-      progressMs,
-      paused: true,
-      atMs: Date.now(),
-    };
+    lastProgressSample = { progressMs, paused: true, atMs: Date.now() };
   }
 }
 
@@ -351,10 +387,9 @@ async function pushSnapshotTo(client) {
 
 async function handleProgressQuery(res) {
   try {
-    // Prefer recent monitor cache to avoid expensive one-shot osascript on Folia's 7s probe.
     let snap = currentSnap();
     const stale = !snap.sampledAtMs || Date.now() - snap.sampledAtMs > 1500;
-    if (!DEMO && (!snap.ok || stale)) {
+    if (!DEMO && clients.size > 0 && (!snap.ok || stale)) {
       snap = await readMusicSnapshot();
     }
     if (!snap.ok || !snap.hasSong) {
@@ -397,11 +432,12 @@ const server = http.createServer((req, res) => {
       service: 'folia-macos-nowplaying',
       port: PORT,
       ws: `ws://${HOST}:${PORT}${WS_PATH}`,
-      clients: clients.size,
       offsetMs: OFFSET_MS,
       pollMs: POLL_MS,
       progressPushMs: PROGRESS_PUSH_MS,
+      idleStopMs: IDLE_STOP_MS,
       mode: DEMO ? 'demo' : 'Music.app',
+      memory: memoryStats(),
     }));
     return;
   }
@@ -416,20 +452,27 @@ const server = http.createServer((req, res) => {
     `Folia macOS Now Playing bridge\n`
     + `WebSocket: ws://${HOST}:${PORT}${WS_PATH}\n`
     + `Progress:  GET /api/query/progress\n`
-    + `Offset:    ${OFFSET_MS}ms (FOLIA_NP_OFFSET_MS)\n`
-    + `Progress push every ${PROGRESS_PUSH_MS}ms (FOLIA_NP_PROGRESS_PUSH_MS)\n`,
+    + `Memory:    ${JSON.stringify(memoryStats())}\n`,
   );
 });
 
-const wss = new WebSocketServer({ server, path: WS_PATH });
+const wss = new WebSocketServer({
+  server,
+  path: WS_PATH,
+  // Avoid per-connection zlib inflate/deflate contexts.
+  perMessageDeflate: false,
+  maxPayload: 64 * 1024,
+});
 
 wss.on('connection', (socket) => {
   clients.add(socket);
-  console.log(`[np] client connected (${clients.size})`);
+  ensureMonitorForClients();
+  console.log(`[np] client connected (${clients.size}) monitor=${isMonitorRunning()}`);
   void pushSnapshotTo(socket);
   socket.on('close', () => {
     clients.delete(socket);
     console.log(`[np] client disconnected (${clients.size})`);
+    if (clients.size === 0) scheduleIdleStop();
   });
 });
 
@@ -438,9 +481,9 @@ server.listen(PORT, HOST, () => {
   console.log(`[np]   HTTP  http://${HOST}:${PORT}/health`);
   console.log(`[np]   PROG  http://${HOST}:${PORT}/api/query/progress`);
   console.log(`[np]   WS    ws://${HOST}:${PORT}${WS_PATH}`);
-  console.log(`[np]   mode  ${DEMO ? 'demo' : 'Music.app (persistent monitor)'}`);
-  console.log(`[np]   offset ${OFFSET_MS}ms | progress push ${PROGRESS_PUSH_MS}ms`);
-  console.log(`[np] Open Folia → 设置 → 连接与集成 → 舞台模式 → Now Playing`);
+  console.log(`[np]   mode  ${DEMO ? 'demo' : 'Music.app (start monitor on demand)'}`);
+  console.log(`[np]   offset ${OFFSET_MS}ms | progress push ${PROGRESS_PUSH_MS}ms | idle stop ${IDLE_STOP_MS}ms`);
+  console.log(`[np]   mem   ${JSON.stringify(memoryStats())}`);
 });
 
 setInterval(() => {
@@ -452,6 +495,7 @@ setInterval(() => {
 }, POLL_MS);
 
 function shutdown() {
+  if (idleStopTimer) clearTimeout(idleStopTimer);
   stopMusicMonitor();
   server.close();
   process.exit(0);

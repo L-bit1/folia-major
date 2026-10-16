@@ -7,8 +7,8 @@
     "folia-macos-nowplaying": "src/server.js"
   },
   "scripts": {
-    "start": "node src/server.js",
-    "demo": "node src/server.js --demo",
+    "start": "node --max-old-space-size=64 src/server.js",
+    "demo": "node --max-old-space-size=64 src/server.js --demo",
     "dev": "node --watch src/server.js"
   },
   "engines": {

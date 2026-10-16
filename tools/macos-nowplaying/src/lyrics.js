@@ -1,5 +1,6 @@
-const LRU_MAX = 64;
-/** @type {Map<string, { lrc: string | null, fetchedAt: number }>} */
+/** Keep only a few recent LRC strings — each can be several KB. */
+const LRU_MAX = 8;
+/** @type {Map<string, string | null>} */
 const cache = new Map();
 
 const UA = 'folia-macos-nowplaying/0.1 (+https://github.com/chthollyphile/folia-major; tools/macos-nowplaying)';
@@ -14,11 +15,13 @@ function cacheKey(title, artist, durationSec) {
 }
 
 function remember(key, lrc) {
-  if (cache.size >= LRU_MAX) {
+  if (cache.has(key)) cache.delete(key);
+  cache.set(key, lrc);
+  while (cache.size > LRU_MAX) {
     const oldest = cache.keys().next().value;
-    if (oldest) cache.delete(oldest);
+    if (oldest === undefined) break;
+    cache.delete(oldest);
   }
-  cache.set(key, { lrc, fetchedAt: Date.now() });
 }
 
 function normalizeName(value) {
@@ -36,11 +39,9 @@ function pickLrc(entry) {
   if (synced) return synced;
   const plain = typeof entry.plainLyrics === 'string' ? entry.plainLyrics.trim() : '';
   if (!plain) return null;
-  return plain
-    .split('\n')
-    .filter(Boolean)
-    .map((line, i) => `[00:${String(i).padStart(2, '0')}.00]${line}`)
-    .join('\n');
+  // Avoid building huge synthetic LRC for long plain text.
+  const lines = plain.split('\n').filter(Boolean).slice(0, 200);
+  return lines.map((line, i) => `[00:${String(i).padStart(2, '0')}.00]${line}`).join('\n');
 }
 
 function scoreCandidate(entry, title, artist, durationSec) {
@@ -64,13 +65,13 @@ function scoreCandidate(entry, title, artist, durationSec) {
   return score;
 }
 
-async function fetchJson(url, { retries = 3 } = {}) {
+async function fetchJson(url, { retries = 2 } = {}) {
   for (let attempt = 0; attempt < retries; attempt += 1) {
     const resp = await fetch(url, { headers: { 'User-Agent': UA } });
     if (resp.status === 404) return null;
     if (resp.status === 429) {
       const retryAfter = Number(resp.headers.get('retry-after'));
-      const waitMs = Number.isFinite(retryAfter) ? retryAfter * 1000 : 1200 * (attempt + 1);
+      const waitMs = Number.isFinite(retryAfter) ? retryAfter * 1000 : 1000 * (attempt + 1);
       await sleep(waitMs);
       continue;
     }
@@ -78,6 +79,27 @@ async function fetchJson(url, { retries = 3 } = {}) {
     return resp.json();
   }
   return null;
+}
+
+/**
+ * Score search hits using metadata only, then keep lyric text from the winner.
+ * Avoid retaining full result arrays (each hit can embed a full syncedLyrics blob).
+ */
+function pickBestFromSearch(results, title, artist, durationSec) {
+  if (!Array.isArray(results) || results.length === 0) return null;
+  let best = null;
+  let bestScore = -Infinity;
+  for (const entry of results) {
+    const score = scoreCandidate(entry, title, artist, durationSec);
+    if (score > bestScore) {
+      bestScore = score;
+      best = entry;
+    }
+  }
+  if (!best || bestScore < 60) return null;
+  const lrc = pickLrc(best);
+  // Drop references to the large results array ASAP.
+  return lrc;
 }
 
 /**
@@ -92,9 +114,9 @@ export async function fetchLyrics(track) {
   }
 
   const key = cacheKey(title, artist, track.duration);
-  const hit = cache.get(key);
-  if (hit) {
-    return { lrc: hit.lrc, source: hit.lrc ? 'lrclib' : null };
+  if (cache.has(key)) {
+    const lrc = cache.get(key) ?? null;
+    return { lrc, source: lrc ? 'lrclib' : null };
   }
 
   try {
@@ -114,35 +136,28 @@ export async function fetchLyrics(track) {
       return { lrc: exactLrc, source: 'lrclib' };
     }
 
-    await sleep(350);
+    await sleep(250);
 
-    const searchQueries = [
-      new URLSearchParams({ track_name: title, artist_name: artist || '' }),
-      new URLSearchParams({ q: [title, artist].filter(Boolean).join(' ') }),
-    ];
+    const searchParams = new URLSearchParams({ track_name: title, artist_name: artist || '' });
+    let results = await fetchJson(`https://lrclib.net/api/search?${searchParams}`);
+    let lrc = pickBestFromSearch(results, title, artist, track.duration);
+    results = null;
 
-    /** @type {Array<{ entry: any, score: number }>} */
-    let ranked = [];
-    for (const params of searchQueries) {
-      const results = await fetchJson(`https://lrclib.net/api/search?${params}`);
-      if (!Array.isArray(results) || results.length === 0) continue;
-      ranked = results
-        .map((entry) => ({ entry, score: scoreCandidate(entry, title, artist, track.duration) }))
-        .sort((a, b) => b.score - a.score);
-      if (ranked[0]?.score >= 60) break;
-      await sleep(350);
+    if (!lrc) {
+      await sleep(250);
+      const qParams = new URLSearchParams({ q: [title, artist].filter(Boolean).join(' ') });
+      results = await fetchJson(`https://lrclib.net/api/search?${qParams}`);
+      lrc = pickBestFromSearch(results, title, artist, track.duration);
+      results = null;
     }
 
-    const best = ranked[0];
-    if (!best || best.score < 60) {
-      remember(key, null);
-      return { lrc: null, source: null };
-    }
-
-    const lrc = pickLrc(best.entry);
     remember(key, lrc);
     return { lrc, source: lrc ? 'lrclib' : null };
   } catch {
     return { lrc: null, source: null };
   }
+}
+
+export function lyricCacheSize() {
+  return cache.size;
 }

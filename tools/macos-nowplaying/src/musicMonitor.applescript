@@ -1,5 +1,5 @@
--- Persistent Music.app monitor. Prints one JSON object per line.
--- Keep this process alive; spawning osascript every poll is slow and can stutter Folia.
+-- Persistent Music.app monitor. Prints one JSON object per line on stderr via `log`.
+-- Keep this process alive only while Folia clients are connected.
 
 on jsonEscape(inputText)
 	set s to inputText as text
@@ -55,5 +55,6 @@ repeat
 	on error errMsg
 		log "{\"ok\":false,\"reason\":\"" & my jsonEscape(errMsg) & "\"}"
 	end try
-	delay 0.35
+	-- 0.5s is enough; Folia extrapolates between PlayerProgress pushes.
+	delay 0.5
 end repeat
