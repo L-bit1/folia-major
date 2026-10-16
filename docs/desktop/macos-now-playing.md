@@ -1,6 +1,6 @@
 # macOS：用 Music.app / Apple Music 驱动 Folia 歌词舞台
 
-Folia 桌面版的 **Now Playing** 舞台源会连接：
+桌面版在 macOS 上选择 **舞台模式 → Now Playing** 后，会在应用内启动 Music.app 桥接，无需再单独运行 `tools/macos-nowplaying`。协议仍是：
 
 ```text
 ws://localhost:9863/api/ws/lyric
